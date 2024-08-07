@@ -129,7 +129,6 @@ pub(crate) fn component_to_tokens(
             if idx == spread_marker {
                 return None;
             }
-            use syn::{RangeLimits, Stmt};
 
             if let NodeAttribute::Block(block) = attr {
                 let dotted = if let NodeBlock::ValidBlock(block) = block {
