@@ -18,7 +18,7 @@
 //! | [`Track`]         | —     | Tracks changes to this value, adding it as a source of the current reactive observer. |
 //! | [`Trigger`]       | —     | Notifies subscribers that this value has changed.                                     |
 //! | [`ReadUntracked`] | Guard | Gives immutable access to the value of this signal.                                   |
-//! | [`Writeable`]     | Guard | Gives mutable access to the value of this signal.
+//! | [`Write`]     | Guard | Gives mutable access to the value of this signal.
 //!
 //! ## Derived Traits
 //!
@@ -33,7 +33,7 @@
 //! ### Update
 //! | Trait               | Mode          | Composition                       | Description
 //! |---------------------|---------------|-----------------------------------|------------
-//! | [`UpdateUntracked`] | `fn(&mut T)`  | [`Writeable`]                     | Applies closure to the current value to update it, but doesn't notify subscribers.
+//! | [`UpdateUntracked`] | `fn(&mut T)`  | [`Write`]                     | Applies closure to the current value to update it, but doesn't notify subscribers.
 //! | [`Update`]          | `fn(&mut T)`  | [`UpdateUntracked`] + [`Trigger`] | Applies closure to the current value to update it, and notifies subscribers.
 //! | [`Set`]             | `T`           | [`Update`]                        | Sets the value to a new value, and notifies subscribers.
 //!
@@ -52,7 +52,7 @@ use crate::{
     effect::Effect,
     graph::{Observer, Source, Subscriber, ToAnySource},
     owner::Owner,
-    signal::{arc_signal, ArcReadSignal},
+    signal::{arc_signal, guards::UntrackedWriteGuard, ArcReadSignal},
 };
 use any_spawner::Executor;
 use futures::{Stream, StreamExt};
@@ -61,6 +61,7 @@ use std::{
     panic::Location,
 };
 
+#[doc(hidden)]
 /// Provides a sensible panic message for accessing disposed signals.
 #[macro_export]
 macro_rules! unwrap_signal {
@@ -213,7 +214,7 @@ pub trait UntrackableGuard: DerefMut {
 
 /// Gives mutable access to a signal's value through a guard type. When the guard is dropped, the
 /// signal's subscribers will be notified.
-pub trait Writeable: Sized + DefinedAt + Notify {
+pub trait Write: Sized + DefinedAt + Notify {
     /// The type of the signal's value.
     type Value: Sized + 'static;
 
@@ -421,9 +422,9 @@ pub trait UpdateUntracked: DefinedAt {
 
 impl<T> UpdateUntracked for T
 where
-    T: Writeable,
+    T: Write,
 {
-    type Value = <Self as Writeable>::Value;
+    type Value = <Self as Write>::Value;
 
     #[track_caller]
     fn try_update_untracked<U>(
@@ -478,9 +479,9 @@ pub trait Update {
 
 impl<T> Update for T
 where
-    T: Writeable,
+    T: Write,
 {
-    type Value = <Self as Writeable>::Value;
+    type Value = <Self as Write>::Value;
 
     #[track_caller]
     fn try_maybe_update<U>(
@@ -636,5 +637,191 @@ pub fn panic_getting_disposed_signal(
             "At {location}, you tried to access a reactive value, but it has \
              already been disposed."
         )
+    }
+}
+
+/// A variation of the [`Read`] trait that provides a signposted "always-non-reactive" API.
+/// E.g. for [`StoredValue`](`crate::owner::StoredValue`).
+pub trait ReadValue: Sized + DefinedAt {
+    /// The guard type that will be returned, which can be dereferenced to the value.
+    type Value: Deref;
+
+    /// Returns the non-reactive guard, or `None` if the value has already been disposed.
+    #[track_caller]
+    fn try_read_value(&self) -> Option<Self::Value>;
+
+    /// Returns the non-reactive guard.
+    ///
+    /// # Panics
+    /// Panics if you try to access a value that has been disposed.
+    #[track_caller]
+    fn read_value(&self) -> Self::Value {
+        self.try_read_value().unwrap_or_else(unwrap_signal!(self))
+    }
+}
+
+/// A variation of the [`With`] trait that provides a signposted "always-non-reactive" API.
+/// E.g. for [`StoredValue`](`crate::owner::StoredValue`).
+pub trait WithValue: DefinedAt {
+    /// The type of the value contained in the value.
+    type Value: ?Sized;
+
+    /// Applies the closure to the value, non-reactively, and returns the result,
+    /// or `None` if the value has already been disposed.
+    #[track_caller]
+    fn try_with_value<U>(
+        &self,
+        fun: impl FnOnce(&Self::Value) -> U,
+    ) -> Option<U>;
+
+    /// Applies the closure to the value, non-reactively, and returns the result.
+    ///
+    /// # Panics
+    /// Panics if you try to access a value that has been disposed.
+    #[track_caller]
+    fn with_value<U>(&self, fun: impl FnOnce(&Self::Value) -> U) -> U {
+        self.try_with_value(fun)
+            .unwrap_or_else(unwrap_signal!(self))
+    }
+}
+
+impl<T> WithValue for T
+where
+    T: DefinedAt + ReadValue,
+{
+    type Value = <<Self as ReadValue>::Value as Deref>::Target;
+
+    fn try_with_value<U>(
+        &self,
+        fun: impl FnOnce(&Self::Value) -> U,
+    ) -> Option<U> {
+        self.try_read_value().map(|value| fun(&value))
+    }
+}
+
+/// A variation of the [`Get`] trait that provides a signposted "always-non-reactive" API.
+/// E.g. for [`StoredValue`](`crate::owner::StoredValue`).
+pub trait GetValue: DefinedAt {
+    /// The type of the value contained in the value.
+    type Value: Clone;
+
+    /// Clones and returns the value of the value, non-reactively,
+    /// or `None` if the value has already been disposed.
+    #[track_caller]
+    fn try_get_value(&self) -> Option<Self::Value>;
+
+    /// Clones and returns the value of the value, non-reactively.
+    ///
+    /// # Panics
+    /// Panics if you try to access a value that has been disposed.
+    #[track_caller]
+    fn get_value(&self) -> Self::Value {
+        self.try_get_value().unwrap_or_else(unwrap_signal!(self))
+    }
+}
+
+impl<T> GetValue for T
+where
+    T: WithValue,
+    T::Value: Clone,
+{
+    type Value = <Self as WithValue>::Value;
+
+    fn try_get_value(&self) -> Option<Self::Value> {
+        self.try_with_value(Self::Value::clone)
+    }
+}
+
+/// A variation of the [`Write`] trait that provides a signposted "always-non-reactive" API.
+/// E.g. for [`StoredValue`](`crate::owner::StoredValue`).
+pub trait WriteValue: Sized + DefinedAt {
+    /// The type of the value's value.
+    type Value: Sized + 'static;
+
+    /// Returns a non-reactive write guard, or `None` if the value has already been disposed.
+    #[track_caller]
+    fn try_write_value(&self) -> Option<UntrackedWriteGuard<Self::Value>>;
+
+    /// Returns a non-reactive write guard.
+    ///
+    /// # Panics
+    /// Panics if you try to access a value that has been disposed.
+    #[track_caller]
+    fn write_value(&self) -> UntrackedWriteGuard<Self::Value> {
+        self.try_write_value().unwrap_or_else(unwrap_signal!(self))
+    }
+}
+
+/// A variation of the [`Update`] trait that provides a signposted "always-non-reactive" API.
+/// E.g. for [`StoredValue`](`crate::owner::StoredValue`).
+pub trait UpdateValue: DefinedAt {
+    /// The type of the value contained in the value.
+    type Value;
+
+    /// Updates the value, returning the value that is
+    /// returned by the update function, or `None` if the value has already been disposed.
+    #[track_caller]
+    fn try_update_value<U>(
+        &self,
+        fun: impl FnOnce(&mut Self::Value) -> U,
+    ) -> Option<U>;
+
+    /// Updates the value.
+    #[track_caller]
+    fn update_value(&self, fun: impl FnOnce(&mut Self::Value)) {
+        self.try_update_value(fun);
+    }
+}
+
+impl<T> UpdateValue for T
+where
+    T: WriteValue,
+{
+    type Value = <Self as WriteValue>::Value;
+
+    #[track_caller]
+    fn try_update_value<U>(
+        &self,
+        fun: impl FnOnce(&mut Self::Value) -> U,
+    ) -> Option<U> {
+        let mut guard = self.try_write_value()?;
+        Some(fun(&mut *guard))
+    }
+}
+
+/// A variation of the [`Set`] trait that provides a signposted "always-non-reactive" API.
+/// E.g. for [`StoredValue`](`crate::owner::StoredValue`).
+pub trait SetValue: DefinedAt {
+    /// The type of the value contained in the value.
+    type Value;
+
+    /// Updates the value by replacing it, non-reactively.
+    ///
+    /// If the value has already been disposed, returns `Some(value)` with the value that was
+    /// passed in. Otherwise, returns `None`.
+    #[track_caller]
+    fn try_set_value(&self, value: Self::Value) -> Option<Self::Value>;
+
+    /// Updates the value by replacing it, non-reactively.
+    #[track_caller]
+    fn set_value(&self, value: Self::Value) {
+        self.try_set_value(value);
+    }
+}
+
+impl<T> SetValue for T
+where
+    T: WriteValue,
+{
+    type Value = <Self as WriteValue>::Value;
+
+    fn try_set_value(&self, value: Self::Value) -> Option<Self::Value> {
+        // Unlike most other traits, for these None actually means success:
+        if let Some(mut guard) = self.try_write_value() {
+            *guard = value;
+            None
+        } else {
+            Some(value)
+        }
     }
 }

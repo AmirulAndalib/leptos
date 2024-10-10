@@ -6,7 +6,7 @@ use super::{
 use crate::{
     graph::{ReactiveNode, SubscriberSet},
     prelude::{IsDisposed, Notify},
-    traits::{DefinedAt, ReadUntracked, UntrackableGuard, Writeable},
+    traits::{DefinedAt, ReadUntracked, UntrackableGuard, Write},
 };
 use core::fmt::{Debug, Formatter, Result};
 use std::{
@@ -50,20 +50,20 @@ use std::{
 /// - [`.set()`](crate::traits::Set) sets the signal to a new value.
 /// - [`.update()`](crate::traits::Update) updates the value of the signal by
 ///   applying a closure that takes a mutable reference.
-/// - [`.write()`](crate::traits::Writeable) returns a guard through which the signal
+/// - [`.write()`](crate::traits::Write) returns a guard through which the signal
 ///   can be mutated, and which notifies subscribers when it is dropped.
 ///
 /// > Each of these has a related `_untracked()` method, which updates the signal
 /// > without notifying subscribers. Untracked updates are not desirable in most
 /// > cases, as they cause “tearing” between the signal’s value and its observed
-/// > value. If you want a non-reactive container, used [`StoredValue`](crate::owner::StoredValue)
+/// > value. If you want a non-reactive container, used [`ArenaItem`](crate::owner::ArenaItem)
 /// > instead.
 ///
 /// ## Examples
 ///
 /// ```
 /// # use reactive_graph::prelude::*;
-/// # use reactive_graph::signal::*;
+/// # use reactive_graph::signal::*; let owner = reactive_graph::owner::Owner::new(); owner.set();
 /// let count = ArcRwSignal::new(0);
 ///
 /// // ✅ calling the getter clones and returns the value
@@ -253,7 +253,7 @@ impl<T> Notify for ArcRwSignal<T> {
     }
 }
 
-impl<T: 'static> Writeable for ArcRwSignal<T> {
+impl<T: 'static> Write for ArcRwSignal<T> {
     type Value = T;
 
     fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {

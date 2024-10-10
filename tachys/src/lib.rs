@@ -5,7 +5,7 @@
 
 #![allow(incomplete_features)] // yolo
 #![cfg_attr(feature = "nightly", feature(unsized_const_params))]
-#![deny(missing_docs)]
+//#![deny(missing_docs)]
 
 /// Commonly-used traits.
 pub mod prelude {
@@ -19,6 +19,7 @@ pub mod prelude {
                     OnAttribute, OnTargetAttribute, PropAttribute,
                     StyleAttribute,
                 },
+                IntoAttributeValue,
             },
             directive::DirectiveAttribute,
             element::{ElementChild, ElementExt, InnerHtmlAttribute},
@@ -26,8 +27,8 @@ pub mod prelude {
         },
         renderer::{dom::Dom, Renderer},
         view::{
-            add_attr::AddAnyAttr, any_view::IntoAny, Mountable, Render,
-            RenderHtml,
+            add_attr::AddAnyAttr, any_view::IntoAny, IntoRender, Mountable,
+            Render, RenderHtml,
         },
     };
 }

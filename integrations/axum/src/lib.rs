@@ -53,7 +53,7 @@ use leptos::{
     config::LeptosOptions,
     context::{provide_context, use_context},
     prelude::*,
-    reactive_graph::{computed::ScopedFuture, owner::Owner},
+    reactive::{computed::ScopedFuture, owner::Owner},
     IntoView,
 };
 use leptos_integration_utils::{
@@ -76,7 +76,7 @@ use server_fn::{redirect::REDIRECT_HEADER, ServerFnError};
 use std::path::Path;
 use std::{fmt::Debug, io, pin::Pin, sync::Arc};
 #[cfg(feature = "default")]
-use tower::ServiceExt;
+use tower::util::ServiceExt;
 #[cfg(feature = "default")]
 use tower_http::services::ServeDir;
 // use tracing::Instrument; // TODO check tracing span -- was this used in 0.6 for a missing link?
@@ -606,9 +606,9 @@ where
 /// use axum::{
 ///     body::Body,
 ///     extract::Path,
+///     http::Request,
 ///     response::{IntoResponse, Response},
 /// };
-/// use http::Request;
 /// use leptos::{config::LeptosOptions, context::provide_context, prelude::*};
 ///
 /// async fn custom_handler(
@@ -784,7 +784,7 @@ where
     _ = replace_blocks; // TODO
     handle_response(additional_context, app_fn, |app, chunks| {
         Box::pin(async move {
-            let app = if cfg!(feature = "islands-router") {
+            let app = if cfg!(feature = "dont-use-islands-router") {
                 app.to_html_stream_out_of_order_branching()
             } else {
                 app.to_html_stream_out_of_order()
@@ -806,9 +806,9 @@ where
 /// use axum::{
 ///     body::Body,
 ///     extract::Path,
+///     http::Request,
 ///     response::{IntoResponse, Response},
 /// };
-/// use http::Request;
 /// use leptos::context::provide_context;
 ///
 /// async fn custom_handler(
@@ -849,7 +849,7 @@ where
     IV: IntoView + 'static,
 {
     handle_response(additional_context, app_fn, |app, chunks| {
-        let app = if cfg!(feature = "islands-router") {
+        let app = if cfg!(feature = "dont-use-islands-router") {
             app.to_html_stream_in_order_branching()
         } else {
             app.to_html_stream_in_order()
@@ -1025,9 +1025,9 @@ where
 /// use axum::{
 ///     body::Body,
 ///     extract::Path,
+///     http::Request,
 ///     response::{IntoResponse, Response},
 /// };
-/// use http::Request;
 /// use leptos::context::provide_context;
 ///
 /// async fn custom_handler(
@@ -1069,7 +1069,7 @@ where
 {
     handle_response(additional_context, app_fn, |app, chunks| {
         Box::pin(async move {
-            let app = if cfg!(feature = "islands-router") {
+            let app = if cfg!(feature = "dont-use-islands-router") {
                 app.to_html_stream_in_order_branching()
             } else {
                 app.to_html_stream_in_order()
@@ -1093,9 +1093,9 @@ where
 /// use axum::{
 ///     body::Body,
 ///     extract::Path,
+///     http::Request,
 ///     response::{IntoResponse, Response},
 /// };
-/// use http::Request;
 /// use leptos::context::provide_context;
 ///
 /// async fn custom_handler(
@@ -1146,7 +1146,7 @@ where
     IV: IntoView + 'static,
 {
     Box::pin(async move {
-        let app = if cfg!(feature = "islands-router") {
+        let app = if cfg!(feature = "dont-use-islands-router") {
             app.to_html_stream_in_order_branching()
         } else {
             app.to_html_stream_in_order()
@@ -1342,8 +1342,7 @@ where
         .with(|| {
             // stub out a path for now
             provide_context(RequestUrl::new(""));
-            let (mock_parts, _) =
-                http::Request::new(Body::from("")).into_parts();
+            let (mock_parts, _) = Request::new(Body::from("")).into_parts();
             let (mock_meta, _) = ServerMetaContext::new();
             provide_contexts("", &mock_meta, mock_parts, Default::default());
             additional_context();
@@ -1402,8 +1401,8 @@ impl StaticRouteGenerator {
             let add_context = additional_context.clone();
             move || {
                 let full_path = format!("http://leptos.dev{path}");
-                let mock_req = http::Request::builder()
-                    .method(http::Method::GET)
+                let mock_req = Request::builder()
+                    .method(Method::GET)
                     .header("Accept", "text/html")
                     .body(Body::empty())
                     .unwrap();
@@ -1495,10 +1494,12 @@ impl StaticRouteGenerator {
             _ = routes;
             _ = app_fn;
             _ = additional_context;
-            panic!(
-                "Static routes are not currently supported on WASM32 server \
-                 targets."
-            );
+            Self(Box::new(|_| {
+                panic!(
+                    "Static routes are not currently supported on WASM32 \
+                     server targets."
+                );
+            }))
         }
     }
 
@@ -1933,7 +1934,7 @@ where
 ///
 /// #[server]
 /// pub async fn request_method() -> Result<String, ServerFnError> {
-///     use http::Method;
+///     use axum::http::Method;
 ///     use leptos_axum::extract;
 ///
 ///     // you can extract anything that a regular Axum extractor can extract

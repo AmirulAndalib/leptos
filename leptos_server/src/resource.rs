@@ -13,7 +13,7 @@ use codee::{
 };
 use core::{fmt::Debug, marker::PhantomData};
 use futures::Future;
-use hydration_context::SerializedDataId;
+use hydration_context::{SerializedDataId, SharedContext};
 use reactive_graph::{
     computed::{
         ArcAsyncDerived, ArcMemo, AsyncDerived, AsyncDerivedFuture,
@@ -24,7 +24,39 @@ use reactive_graph::{
     prelude::*,
     signal::{ArcRwSignal, RwSignal},
 };
-use std::{future::IntoFuture, ops::Deref, panic::Location};
+use std::{
+    future::{pending, IntoFuture},
+    ops::Deref,
+    panic::Location,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+
+pub(crate) static IS_SUPPRESSING_RESOURCE_LOAD: AtomicBool =
+    AtomicBool::new(false);
+
+pub struct SuppressResourceLoad;
+
+impl SuppressResourceLoad {
+    pub fn new() -> Self {
+        IS_SUPPRESSING_RESOURCE_LOAD.store(true, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Default for SuppressResourceLoad {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SuppressResourceLoad {
+    fn drop(&mut self) {
+        IS_SUPPRESSING_RESOURCE_LOAD.store(false, Ordering::Relaxed);
+    }
+}
 
 pub struct ArcResource<T, Ser = JsonSerdeCodec> {
     ser: PhantomData<Ser>,
@@ -77,6 +109,49 @@ impl<T, Ser> Deref for ArcResource<T, Ser> {
     }
 }
 
+impl<T, Ser> Track for ArcResource<T, Ser>
+where
+    T: 'static,
+{
+    fn track(&self) {
+        self.data.track();
+    }
+}
+
+impl<T, Ser> ReadUntracked for ArcResource<T, Ser>
+where
+    T: 'static,
+{
+    type Value = <ArcAsyncDerived<T> as ReadUntracked>::Value;
+
+    #[track_caller]
+    fn try_read_untracked(&self) -> Option<Self::Value> {
+        #[cfg(all(feature = "hydration", debug_assertions))]
+        {
+            use reactive_graph::{
+                computed::suspense::SuspenseContext, owner::use_context,
+            };
+            let suspense = use_context::<SuspenseContext>();
+            if suspense.is_none() {
+                let location = std::panic::Location::caller();
+                reactive_graph::log_warning(format_args!(
+                    "At {location}, you are reading a resource in `hydrate` \
+                     mode outside a <Suspense/> or <Transition/>. This can \
+                     cause hydration mismatch errors and loses out on a \
+                     significant performance optimization. To fix this issue, \
+                     you can either: \n1. Wrap the place where you read the \
+                     resource in a <Suspense/> or <Transition/> component, or \
+                     \n2. Switch to using ArcLocalResource::new(), which will \
+                     wait to load the resource until the app is hydrated on \
+                     the client side. (This will have worse performance in \
+                     most cases.)",
+                ));
+            }
+        }
+        self.data.try_read_untracked()
+    }
+}
+
 impl<T, Ser> ArcResource<T, Ser>
 where
     Ser: Encoder<T> + Decoder<T>,
@@ -104,7 +179,7 @@ where
             .map(|sc| sc.next_id())
             .unwrap_or_default();
 
-        let initial = Self::initial_value(&id);
+        let initial = initial_value::<T, Ser>(&id, shared_context.as_ref());
         let is_ready = initial.is_some();
 
         let refetch = ArcRwSignal::new(0);
@@ -116,7 +191,14 @@ where
             let source = source.clone();
             move || {
                 let (_, source) = source.get();
-                fetcher(source)
+                let fut = fetcher(source);
+                async move {
+                    if IS_SUPPRESSING_RESOURCE_LOAD.load(Ordering::Relaxed) {
+                        pending().await
+                    } else {
+                        fut.await
+                    }
+                }
             }
         };
 
@@ -175,43 +257,53 @@ where
     pub fn refetch(&self) {
         *self.refetch.write() += 1;
     }
+}
 
-    #[inline(always)]
-    #[allow(unused)]
-    fn initial_value(id: &SerializedDataId) -> Option<T> {
-        #[cfg(feature = "hydration")]
-        {
-            use std::borrow::Borrow;
+#[inline(always)]
+#[allow(unused)]
+pub(crate) fn initial_value<T, Ser>(
+    id: &SerializedDataId,
+    shared_context: Option<&Arc<dyn SharedContext + Send + Sync>>,
+) -> Option<T>
+where
+    Ser: Encoder<T> + Decoder<T>,
+    <Ser as Encoder<T>>::Error: Debug,
+    <Ser as Decoder<T>>::Error: Debug,
+    <<Ser as Decoder<T>>::Encoded as FromEncodedStr>::DecodingError: Debug,
+    <Ser as Encoder<T>>::Encoded: IntoEncodedString,
+    <Ser as Decoder<T>>::Encoded: FromEncodedStr,
+{
+    #[cfg(feature = "hydration")]
+    {
+        use std::borrow::Borrow;
 
-            let shared_context = Owner::current_shared_context();
-            if let Some(shared_context) = shared_context {
-                let value = shared_context.read_data(id);
-                if let Some(value) = value {
-                    let encoded =
-                        match <Ser as Decoder<T>>::Encoded::from_encoded_str(
-                            &value,
-                        ) {
-                            Ok(value) => value,
-                            Err(e) => {
-                                #[cfg(feature = "tracing")]
-                                tracing::error!("couldn't deserialize: {e:?}");
-                                return None;
-                            }
-                        };
-                    let encoded = encoded.borrow();
-                    match Ser::decode(encoded) {
-                        Ok(value) => return Some(value),
-                        #[allow(unused)]
+        let shared_context = Owner::current_shared_context();
+        if let Some(shared_context) = shared_context {
+            let value = shared_context.read_data(id);
+            if let Some(value) = value {
+                let encoded =
+                    match <Ser as Decoder<T>>::Encoded::from_encoded_str(&value)
+                    {
+                        Ok(value) => value,
                         Err(e) => {
                             #[cfg(feature = "tracing")]
                             tracing::error!("couldn't deserialize: {e:?}");
+                            return None;
                         }
+                    };
+                let encoded = encoded.borrow();
+                match Ser::decode(encoded) {
+                    Ok(value) => return Some(value),
+                    #[allow(unused)]
+                    Err(e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!("couldn't deserialize: {e:?}");
                     }
                 }
             }
         }
-        None
     }
+    None
 }
 
 impl<T, E, Ser> ArcResource<Result<T, E>, Ser>
@@ -526,6 +618,49 @@ where
 
     fn deref(&self) -> &Self::Target {
         &self.data
+    }
+}
+
+impl<T, Ser> Track for Resource<T, Ser>
+where
+    T: Send + Sync + 'static,
+{
+    fn track(&self) {
+        self.data.track();
+    }
+}
+
+impl<T, Ser> ReadUntracked for Resource<T, Ser>
+where
+    T: Send + Sync + 'static,
+{
+    type Value = <AsyncDerived<T> as ReadUntracked>::Value;
+
+    #[track_caller]
+    fn try_read_untracked(&self) -> Option<Self::Value> {
+        #[cfg(all(feature = "hydration", debug_assertions))]
+        {
+            use reactive_graph::{
+                computed::suspense::SuspenseContext, owner::use_context,
+            };
+            let suspense = use_context::<SuspenseContext>();
+            if suspense.is_none() {
+                let location = std::panic::Location::caller();
+                reactive_graph::log_warning(format_args!(
+                    "At {location}, you are reading a resource in `hydrate` \
+                     mode outside a <Suspense/> or <Transition/>. This can \
+                     cause hydration mismatch errors and loses out on a \
+                     significant performance optimization. To fix this issue, \
+                     you can either: \n1. Wrap the place where you read the \
+                     resource in a <Suspense/> or <Transition/> component, or \
+                     \n2. Switch to using LocalResource::new(), which will \
+                     wait to load the resource until the app is hydrated on \
+                     the client side. (This will have worse performance in \
+                     most cases.)",
+                ));
+            }
+        }
+        self.data.try_read_untracked()
     }
 }
 

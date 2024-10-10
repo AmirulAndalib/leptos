@@ -1,9 +1,12 @@
 use crate::{
     computed::{ArcMemo, Memo},
     diagnostics::is_suppressing_resource_load,
-    owner::{FromLocal, LocalStorage, Storage, StoredValue, SyncStorage},
+    owner::{
+        ArcStoredValue, ArenaItem, FromLocal, LocalStorage, Storage,
+        SyncStorage,
+    },
     signal::{ArcRwSignal, RwSignal},
-    traits::{DefinedAt, Dispose, Get, GetUntracked, Update},
+    traits::{DefinedAt, Dispose, Get, GetUntracked, GetValue, Update},
     unwrap_signal,
 };
 use any_spawner::Executor;
@@ -24,7 +27,7 @@ use std::{future::Future, panic::Location, pin::Pin, sync::Arc};
 /// # use reactive_graph::actions::*;
 /// # use reactive_graph::prelude::*;
 /// # tokio_test::block_on(async move {
-/// # any_spawner::Executor::init_tokio();
+/// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
 /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
 /// async fn send_new_todo_to_api(task: String) -> usize {
 ///     // do something...
@@ -93,6 +96,7 @@ pub struct ArcAction<I, O> {
     input: ArcRwSignal<Option<I>>,
     value: ArcRwSignal<Option<O>>,
     version: ArcRwSignal<usize>,
+    dispatched: ArcStoredValue<usize>,
     #[allow(clippy::complexity)]
     action_fn: Arc<
         dyn Fn(&I) -> Pin<Box<dyn Future<Output = O> + Send>> + Send + Sync,
@@ -108,6 +112,7 @@ impl<I, O> Clone for ArcAction<I, O> {
             input: self.input.clone(),
             value: self.value.clone(),
             version: self.version.clone(),
+            dispatched: self.dispatched.clone(),
             action_fn: self.action_fn.clone(),
             #[cfg(debug_assertions)]
             defined_at: self.defined_at,
@@ -135,7 +140,7 @@ where
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = ArcAction::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -191,6 +196,7 @@ where
             input: Default::default(),
             value: ArcRwSignal::new(value),
             version: Default::default(),
+            dispatched: Default::default(),
             action_fn: Arc::new(move |input| Box::pin(action_fn(input))),
             #[cfg(debug_assertions)]
             defined_at: Location::caller(),
@@ -230,14 +236,14 @@ where
 
             // Update the state before loading
             self.in_flight.update(|n| *n += 1);
-            let current_version =
-                self.version.try_get_untracked().unwrap_or_default();
+            let current_version = self.dispatched.get_value();
             self.input.try_update(|inp| *inp = Some(input));
 
             // Spawn the task
             crate::spawn({
                 let input = self.input.clone();
                 let version = self.version.clone();
+                let dispatched = self.dispatched.clone();
                 let value = self.value.clone();
                 let in_flight = self.in_flight.clone();
                 async move {
@@ -249,7 +255,7 @@ where
                         // otherwise, update the value
                         result = fut => {
                             in_flight.update(|n| *n = n.saturating_sub(1));
-                            let is_latest = version.get_untracked() <= current_version;
+                            let is_latest = dispatched.get_value() <= current_version;
                             if is_latest {
                                 version.update(|n| *n += 1);
                                 value.update(|n| *n = Some(result));
@@ -282,8 +288,7 @@ where
 
             // Update the state before loading
             self.in_flight.update(|n| *n += 1);
-            let current_version =
-                self.version.try_get_untracked().unwrap_or_default();
+            let current_version = self.dispatched.get_value();
             self.input.try_update(|inp| *inp = Some(input));
 
             // Spawn the task
@@ -291,6 +296,7 @@ where
                 let input = self.input.clone();
                 let version = self.version.clone();
                 let value = self.value.clone();
+                let dispatched = self.dispatched.clone();
                 let in_flight = self.in_flight.clone();
                 async move {
                     select! {
@@ -301,7 +307,7 @@ where
                         // otherwise, update the value
                         result = fut => {
                             in_flight.update(|n| *n = n.saturating_sub(1));
-                            let is_latest = version.get_untracked() <= current_version;
+                            let is_latest = dispatched.get_value() <= current_version;
                             if is_latest {
                                 version.update(|n| *n += 1);
                                 value.update(|n| *n = Some(result));
@@ -351,6 +357,7 @@ where
             input: Default::default(),
             value: ArcRwSignal::new(value),
             version: Default::default(),
+            dispatched: Default::default(),
             action_fn: Arc::new(move |input| {
                 Box::pin(SendWrapper::new(action_fn(input)))
             }),
@@ -367,7 +374,7 @@ impl<I, O> ArcAction<I, O> {
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = ArcAction::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -395,7 +402,7 @@ impl<I, O> ArcAction<I, O> {
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = ArcAction::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -425,7 +432,7 @@ impl<I, O> ArcAction<I, O> {
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = ArcAction::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -456,7 +463,7 @@ impl<I, O> ArcAction<I, O> {
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = ArcAction::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -510,7 +517,7 @@ where
 /// # use reactive_graph::actions::*;
 /// # use reactive_graph::prelude::*;
 /// # tokio_test::block_on(async move {
-/// # any_spawner::Executor::init_tokio();
+/// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
 /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
 /// async fn send_new_todo_to_api(task: String) -> usize {
 ///     // do something...
@@ -561,7 +568,7 @@ where
 /// function, because it is stored in [Action::input] as well.
 ///
 /// ```rust
-/// # use reactive_graph::actions::*;
+/// # use reactive_graph::actions::*; let owner = reactive_graph::owner::Owner::new(); owner.set();
 /// // if there's a single argument, just use that
 /// let action1 = Action::new(|input: &String| {
 ///     let input = input.clone();
@@ -575,7 +582,7 @@ where
 /// let action3 = Action::new(|input: &(usize, String)| async { todo!() });
 /// ```
 pub struct Action<I, O, S = SyncStorage> {
-    inner: StoredValue<ArcAction<I, O>, S>,
+    inner: ArenaItem<ArcAction<I, O>, S>,
     #[cfg(debug_assertions)]
     defined_at: &'static Location<'static>,
 }
@@ -607,7 +614,7 @@ where
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = Action::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -639,7 +646,7 @@ where
         Fu: Future<Output = O> + Send + 'static,
     {
         Self {
-            inner: StoredValue::new(ArcAction::new(action_fn)),
+            inner: ArenaItem::new(ArcAction::new(action_fn)),
             #[cfg(debug_assertions)]
             defined_at: Location::caller(),
         }
@@ -664,9 +671,7 @@ where
         Fu: Future<Output = O> + Send + 'static,
     {
         Self {
-            inner: StoredValue::new(ArcAction::new_with_value(
-                value, action_fn,
-            )),
+            inner: ArenaItem::new(ArcAction::new_with_value(value, action_fn)),
             #[cfg(debug_assertions)]
             defined_at: Location::caller(),
         }
@@ -688,7 +693,7 @@ where
         Fu: Future<Output = O> + Send + 'static,
     {
         Self {
-            inner: StoredValue::new_local(ArcAction::new_unsync(action_fn)),
+            inner: ArenaItem::new_local(ArcAction::new_unsync(action_fn)),
             #[cfg(debug_assertions)]
             defined_at: Location::caller(),
         }
@@ -704,7 +709,7 @@ where
         Fu: Future<Output = O> + Send + 'static,
     {
         Self {
-            inner: StoredValue::new_local(ArcAction::new_unsync_with_value(
+            inner: ArenaItem::new_local(ArcAction::new_unsync_with_value(
                 value, action_fn,
             )),
             #[cfg(debug_assertions)]
@@ -723,7 +728,7 @@ where
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = Action::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -754,7 +759,7 @@ where
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = Action::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -793,7 +798,7 @@ where
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = ArcAction::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -849,7 +854,7 @@ where
     /// # use reactive_graph::actions::*;
     /// # use reactive_graph::prelude::*;
     /// # tokio_test::block_on(async move {
-    /// # any_spawner::Executor::init_tokio();
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
     /// let act = Action::new(|n: &u8| {
     ///     let n = n.to_owned();
@@ -908,7 +913,9 @@ where
     /// Calls the `async` function with a reference to the input type as its argument.
     #[track_caller]
     pub fn dispatch(&self, input: I) -> ActionAbortHandle {
-        self.inner.with_value(|inner| inner.dispatch(input))
+        self.inner
+            .try_with_value(|inner| inner.dispatch(input))
+            .unwrap_or_else(unwrap_signal!(self))
     }
 }
 
@@ -921,7 +928,9 @@ where
     /// Calls the `async` function with a reference to the input type as its argument.
     #[track_caller]
     pub fn dispatch_local(&self, input: I) -> ActionAbortHandle {
-        self.inner.with_value(|inner| inner.dispatch_local(input))
+        self.inner
+            .try_with_value(|inner| inner.dispatch_local(input))
+            .unwrap_or_else(unwrap_signal!(self))
     }
 }
 
@@ -942,7 +951,7 @@ where
         Fu: Future<Output = O> + 'static,
     {
         Self {
-            inner: StoredValue::new_with_storage(ArcAction::new_unsync(
+            inner: ArenaItem::new_with_storage(ArcAction::new_unsync(
                 action_fn,
             )),
             #[cfg(debug_assertions)]
@@ -961,7 +970,7 @@ where
         Fu: Future<Output = O> + 'static,
     {
         Self {
-            inner: StoredValue::new_with_storage(
+            inner: ArenaItem::new_with_storage(
                 ArcAction::new_unsync_with_value(value, action_fn),
             ),
             #[cfg(debug_assertions)]
@@ -1007,7 +1016,7 @@ impl<I, O, S> Copy for Action<I, O, S> {}
 /// # use reactive_graph::actions::*;
 /// # use reactive_graph::prelude::*;
 /// # tokio_test::block_on(async move {
-/// # any_spawner::Executor::init_tokio();
+/// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
 /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
 /// let act = create_action(|n: &u8| {
 ///     let n = n.to_owned();

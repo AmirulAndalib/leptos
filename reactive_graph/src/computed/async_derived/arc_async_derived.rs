@@ -19,7 +19,7 @@ use crate::{
     },
     traits::{
         DefinedAt, IsDisposed, Notify, ReadUntracked, Track, UntrackableGuard,
-        Writeable,
+        Write,
     },
     transition::AsyncTransition,
 };
@@ -53,10 +53,10 @@ use std::{
 /// ## Examples
 /// ```rust
 /// # use reactive_graph::computed::*;
-/// # use reactive_graph::signal::*;
+/// # use reactive_graph::signal::*; let owner = reactive_graph::owner::Owner::new(); owner.set();
 /// # use reactive_graph::prelude::*;
 /// # tokio_test::block_on(async move {
-/// # any_spawner::Executor::init_tokio();
+/// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
 /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
 ///
 /// let signal1 = RwSignal::new(0);
@@ -534,11 +534,11 @@ impl<T: 'static> ArcAsyncDerived<T> {
 
     /// Returns a `Future` that is ready when this resource has next finished loading.
     pub fn ready(&self) -> AsyncDerivedReadyFuture {
-        AsyncDerivedReadyFuture {
-            source: self.to_any_source(),
-            loading: Arc::clone(&self.loading),
-            wakers: Arc::clone(&self.wakers),
-        }
+        AsyncDerivedReadyFuture::new(
+            self.to_any_source(),
+            &self.loading,
+            &self.wakers,
+        )
     }
 }
 
@@ -600,7 +600,7 @@ impl<T: 'static> Notify for ArcAsyncDerived<T> {
     }
 }
 
-impl<T: 'static> Writeable for ArcAsyncDerived<T> {
+impl<T: 'static> Write for ArcAsyncDerived<T> {
     type Value = Option<T>;
 
     fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {

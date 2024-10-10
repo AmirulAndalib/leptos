@@ -14,6 +14,7 @@
 //!
 //! ```rust
 //! # any_spawner::Executor::init_futures_executor();
+//! # let owner = reactive_graph::owner::Owner::new(); owner.set();
 //! use reactive_graph::{
 //!     computed::ArcMemo,
 //!     effect::Effect,
@@ -87,7 +88,7 @@ pub mod traits;
 pub mod transition;
 pub mod wrappers;
 
-pub use graph::untrack;
+use computed::ScopedFuture;
 
 #[cfg(feature = "nightly")]
 mod nightly;
@@ -124,9 +125,42 @@ pub fn log_warning(text: Arguments) {
 
 /// Calls [`Executor::spawn`], but ensures that the task also runs in the current arena, if
 /// multithreaded arena sandboxing is enabled.
-pub(crate) fn spawn(task: impl Future<Output = ()> + Send + 'static) {
+pub fn spawn(task: impl Future<Output = ()> + Send + 'static) {
     #[cfg(feature = "sandboxed-arenas")]
     let task = owner::Sandboxed::new(task);
 
     any_spawner::Executor::spawn(task);
+}
+
+/// Calls [`Executor::spawn_local`], but ensures that the task runs under the current reactive [`Owner`]
+/// and [`Observed`]. Does not cancel the task if the owner is cleaned up.
+pub fn spawn_local_scoped(task: impl Future<Output = ()> + 'static) {
+    let task = ScopedFuture::new(task);
+
+    #[cfg(feature = "sandboxed-arenas")]
+    let task = owner::Sandboxed::new(task);
+
+    any_spawner::Executor::spawn_local(task);
+}
+
+/// Calls [`Executor::spawn_local`], but ensures that the task runs under the current reactive [`Owner`]
+/// and [`Observed`]. Cancels the task if the owner is cleaned up.
+pub fn spawn_local_scoped_with_cancellation(
+    task: impl Future<Output = ()> + 'static,
+) {
+    use crate::owner::on_cleanup;
+    use futures::future::{AbortHandle, Abortable};
+
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    on_cleanup(move || abort_handle.abort());
+
+    let task = Abortable::new(task, abort_registration);
+    let task = ScopedFuture::new(task);
+
+    #[cfg(feature = "sandboxed-arenas")]
+    let task = owner::Sandboxed::new(task);
+
+    any_spawner::Executor::spawn_local(async move {
+        _ = task.await;
+    });
 }

@@ -18,6 +18,7 @@ use syn::{
 };
 
 pub struct Model {
+    is_transparent: bool,
     island: Option<String>,
     docs: Docs,
     unknown_attrs: UnknownAttrs,
@@ -62,6 +63,7 @@ impl Parse for Model {
         });
 
         Ok(Self {
+            is_transparent: false,
             island: None,
             docs,
             unknown_attrs,
@@ -102,6 +104,7 @@ pub fn convert_from_snake_case(name: &Ident) -> Ident {
 impl ToTokens for Model {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let Self {
+            is_transparent,
             island,
             docs,
             unknown_attrs,
@@ -116,20 +119,22 @@ impl ToTokens for Model {
         let no_props = props.is_empty();
 
         // check for components that end ;
-        let ends_semi =
-            body.block.stmts.iter().last().and_then(|stmt| match stmt {
-                Stmt::Item(Item::Macro(mac)) => mac.semi_token.as_ref(),
-                _ => None,
-            });
-        if let Some(semi) = ends_semi {
-            proc_macro_error2::emit_error!(
-                semi.span(),
-                "A component that ends with a `view!` macro followed by a \
-                 semicolon will return (), an empty view. This is usually an \
-                 accident, not intentional, so we prevent it. If you’d like \
-                 to return (), you can do it it explicitly by returning () as \
-                 the last item from the component."
-            );
+        if !is_transparent {
+            let ends_semi =
+                body.block.stmts.iter().last().and_then(|stmt| match stmt {
+                    Stmt::Item(Item::Macro(mac)) => mac.semi_token.as_ref(),
+                    _ => None,
+                });
+            if let Some(semi) = ends_semi {
+                proc_macro_error2::emit_error!(
+                    semi.span(),
+                    "A component that ends with a `view!` macro followed by a \
+                     semicolon will return (), an empty view. This is usually \
+                     an accident, not intentional, so we prevent it. If you’d \
+                     like to return (), you can do it it explicitly by \
+                     returning () as the last item from the component."
+                );
+            }
         }
 
         //body.sig.ident = format_ident!("__{}", body.sig.ident);
@@ -255,7 +260,7 @@ impl ToTokens for Model {
         let body_name = unmodified_fn_name_from_fn_name(&body_name);
         let body_expr = if is_island {
             quote! {
-                ::leptos::reactive_graph::owner::Owner::with_hydration(move || {
+                ::leptos::reactive::owner::Owner::with_hydration(move || {
                     #body_name(#prop_names)
                 })
             }
@@ -265,14 +270,30 @@ impl ToTokens for Model {
             }
         };
 
-        let component = quote! {
-            ::leptos::reactive_graph::untrack(
-                move || {
-                    #tracing_guard_expr
-                    #tracing_props_expr
-                    #body_expr
-                }
-            )
+        let component = if *is_transparent {
+            body_expr
+        } else if cfg!(erase_components) {
+            quote! {
+                ::leptos::prelude::IntoAny::into_any(
+                    ::leptos::prelude::untrack(
+                        move || {
+                            #tracing_guard_expr
+                            #tracing_props_expr
+                            #body_expr
+                        }
+                    )
+                )
+            }
+        } else {
+            quote! {
+                ::leptos::prelude::untrack(
+                    move || {
+                        #tracing_guard_expr
+                        #tracing_props_expr
+                        #body_expr
+                    }
+                )
+            }
         };
 
         // add island wrapper if island
@@ -280,7 +301,7 @@ impl ToTokens for Model {
             let hydrate_fn_name = hydrate_fn_name.as_ref().unwrap();
             quote! {
                 {
-                    if ::leptos::reactive_graph::owner::Owner::current_shared_context()
+                    if ::leptos::reactive::owner::Owner::current_shared_context()
                         .map(|sc| sc.get_is_hydrating())
                         .unwrap_or(false) {
                         ::leptos::either::Either::Left(
@@ -316,9 +337,9 @@ impl ToTokens for Model {
                 quote! {
                     use leptos::tachys::view::any_view::IntoAny;
                     let children = Box::new(|| {
-                        let sc = ::leptos::reactive_graph::owner::Owner::current_shared_context().unwrap();
+                        let sc = ::leptos::reactive::owner::Owner::current_shared_context().unwrap();
                         let prev = sc.get_is_hydrating();
-                        let value = ::leptos::reactive_graph::owner::Owner::with_no_hydration(||
+                        let value = ::leptos::reactive::owner::Owner::with_no_hydration(||
                             ::leptos::tachys::html::islands::IslandChildren::new(children()).into_any()
                         );
                         sc.set_is_hydrating(prev);
@@ -347,41 +368,60 @@ impl ToTokens for Model {
             let island_props = if is_island_with_children
                 || is_island_with_other_props
             {
-                let (destructure, prop_builders) = if is_island_with_other_props
-                {
-                    let prop_names = props
-                        .iter()
-                        .filter_map(|prop| {
-                            if prop.name.ident == "children" {
-                                None
-                            } else {
-                                let name = &prop.name.ident;
-                                Some(quote! { #name, })
-                            }
-                        })
-                        .collect::<TokenStream>();
-                    let destructure = quote! {
-                        let #props_serialized_name {
-                            #prop_names
-                        } = props;
+                let (destructure, prop_builders, optional_props) =
+                    if is_island_with_other_props {
+                        let prop_names = props
+                            .iter()
+                            .filter_map(|prop| {
+                                if prop.name.ident == "children" {
+                                    None
+                                } else {
+                                    let name = &prop.name.ident;
+                                    Some(quote! { #name, })
+                                }
+                            })
+                            .collect::<TokenStream>();
+                        let destructure = quote! {
+                            let #props_serialized_name {
+                                #prop_names
+                            } = props;
+                        };
+                        let prop_builders = props
+                            .iter()
+                            .filter_map(|prop| {
+                                if prop.name.ident == "children"
+                                    || prop.prop_opts.optional
+                                {
+                                    None
+                                } else {
+                                    let name = &prop.name.ident;
+                                    Some(quote! {
+                                        .#name(#name)
+                                    })
+                                }
+                            })
+                            .collect::<TokenStream>();
+                        let optional_props = props
+                            .iter()
+                            .filter_map(|prop| {
+                                if prop.name.ident == "children"
+                                    || !prop.prop_opts.optional
+                                {
+                                    None
+                                } else {
+                                    let name = &prop.name.ident;
+                                    Some(quote! {
+                                        if let Some(#name) = #name {
+                                            props.#name = Some(#name)
+                                        }
+                                    })
+                                }
+                            })
+                            .collect::<TokenStream>();
+                        (destructure, prop_builders, optional_props)
+                    } else {
+                        (quote! {}, quote! {}, quote! {})
                     };
-                    let prop_builders = props
-                        .iter()
-                        .filter_map(|prop| {
-                            if prop.name.ident == "children" {
-                                None
-                            } else {
-                                let name = &prop.name.ident;
-                                Some(quote! {
-                                    .#name(#name)
-                                })
-                            }
-                        })
-                        .collect::<TokenStream>();
-                    (destructure, prop_builders)
-                } else {
-                    (quote! {}, quote! {})
-                };
                 let children = if is_island_with_children {
                     quote! {
                         .children({Box::new(|| {
@@ -405,10 +445,14 @@ impl ToTokens for Model {
 
                 quote! {{
                     #destructure
-                    #props_name::builder()
+                    let mut props = #props_name::builder()
                         #prop_builders
                         #children
-                        .build()
+                        .build();
+
+                    #optional_props
+
+                    props
                 }}
             } else {
                 quote! {}
@@ -497,6 +541,13 @@ impl ToTokens for Model {
 }
 
 impl Model {
+    #[allow(clippy::wrong_self_convention)]
+    pub fn is_transparent(mut self, is_transparent: bool) -> Self {
+        self.is_transparent = is_transparent;
+
+        self
+    }
+
     #[allow(clippy::wrong_self_convention)]
     pub fn with_island(mut self, island: Option<String>) -> Self {
         self.island = island;

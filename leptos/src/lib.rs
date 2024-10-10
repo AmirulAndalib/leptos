@@ -168,14 +168,13 @@ pub mod prelude {
         pub use leptos_server::*;
         pub use oco_ref::*;
         pub use reactive_graph::{
-            actions::*, computed::*, effect::*, owner::*, signal::*, untrack,
-            wrappers::read::*,
+            actions::*, computed::*, effect::*, graph::untrack, owner::*,
+            signal::*, wrappers::read::*,
         };
         pub use server_fn::{self, ServerFnError};
         pub use tachys::{
-            self,
-            reactive_graph::{node_ref::*, Suspend},
-            view::template::ViewTemplate,
+            reactive_graph::{bind::BindAttribute, node_ref::*, Suspend},
+            view::{any_view::AnyView, template::ViewTemplate},
         };
     }
     pub use export_types::*;
@@ -201,10 +200,12 @@ pub mod error {
     pub use throw_error::*;
 }
 
-/// Control-flow components like `<Show>` and `<For>`.
+/// Control-flow components like `<Show>`, `<For>`, and `<Await>`.
 pub mod control_flow {
-    pub use crate::{for_loop::*, show::*};
+    pub use crate::{animated_show::*, await_::*, for_loop::*, show::*};
 }
+mod animated_show;
+mod await_;
 mod for_loop;
 mod show;
 
@@ -230,6 +231,7 @@ mod suspense_component;
 pub mod text_prop;
 mod transition;
 pub use leptos_macro::*;
+#[doc(inline)]
 pub use server_fn;
 #[doc(hidden)]
 pub use typed_builder;
@@ -237,16 +239,22 @@ pub use typed_builder;
 pub use typed_builder_macro;
 mod into_view;
 pub use into_view::IntoView;
+#[doc(inline)]
 pub use leptos_dom;
 mod provider;
+#[doc(inline)]
 pub use tachys;
 /// Tools to mount an application to the DOM, or to hydrate it from server-rendered HTML.
 pub mod mount;
+#[doc(inline)]
 pub use leptos_config as config;
+#[doc(inline)]
 pub use oco_ref as oco;
 mod from_form_data;
+#[doc(inline)]
 pub use either_of as either;
-pub use reactive_graph;
+#[doc(inline)]
+pub use reactive_graph as reactive;
 
 /// Provide and access data along the reactive graph, sharing data without directly passing arguments.
 pub mod context {
@@ -254,17 +262,22 @@ pub mod context {
     pub use reactive_graph::owner::{provide_context, use_context};
 }
 
+#[doc(inline)]
 pub use leptos_server as server;
 /// HTML attribute types.
+#[doc(inline)]
 pub use tachys::html::attribute as attr;
 /// HTML element types.
+#[doc(inline)]
 pub use tachys::html::element as html;
 /// HTML event types.
 #[doc(no_inline)]
 pub use tachys::html::event as ev;
 /// MathML element types.
+#[doc(inline)]
 pub use tachys::mathml as math;
 /// SVG element types.
+#[doc(inline)]
 pub use tachys::svg;
 
 /// Utilities for simple isomorphic logging to the console or terminal.
@@ -272,7 +285,7 @@ pub mod logging {
     pub use leptos_dom::{debug_warn, error, log, warn};
 }
 
-pub mod spawn {
+pub mod task {
     pub use any_spawner::Executor;
     use std::future::Future;
 
@@ -290,9 +303,14 @@ pub mod spawn {
         Executor::spawn_local(fut)
     }
 
+    /// Waits until the next "tick" of the current async executor.
     pub async fn tick() {
         Executor::tick().await
     }
+
+    pub use reactive_graph::{
+        spawn_local_scoped, spawn_local_scoped_with_cancellation,
+    };
 }
 
 // these reexports are used in islands
@@ -309,234 +327,3 @@ pub use tracing;
 pub use wasm_bindgen;
 #[doc(hidden)]
 pub use web_sys;
-
-/*mod additional_attributes;
-pub use additional_attributes::*;
-mod await_;
-pub use await_::*;
-pub use leptos_config::{self, get_configuration, LeptosOptions};
-#[cfg(not(all(
-    target_arch = "wasm32",
-    any(feature = "csr", feature = "hydrate")
-)))]
-/// Utilities for server-side rendering HTML.
-pub mod ssr {
-    pub use leptos_dom::{ssr::*, ssr_in_order::*};
-}
-pub use leptos_dom::{
-    self, create_node_ref, document, ev,
-    helpers::{
-        event_target, event_target_checked, event_target_value,
-        request_animation_frame, request_animation_frame_with_handle,
-        request_idle_callback, request_idle_callback_with_handle, set_interval,
-        set_interval_with_handle, set_timeout, set_timeout_with_handle,
-        window_event_listener, window_event_listener_untyped,
-    },
-    html,
-    html::Binding,
-    math, mount_to, mount_to_body, nonce, svg, window, Attribute, Class,
-    CollectView, Errors, EventHandlerFn, Fragment, HtmlElement, IntoAttribute,
-    IntoClass, IntoProperty, IntoStyle, IntoView, NodeRef, Property, View,
-};
-
-/// Types to make it easier to handle errors in your application.
-pub mod error {
-    pub use server_fn::error::{Error, Result};
-}
-#[cfg(all(target_arch = "wasm32", feature = "template_macro"))]
-pub use leptos_macro::template;
-#[cfg(not(all(target_arch = "wasm32", feature = "template_macro")))]
-pub use leptos_macro::view as template;
-pub use leptos_macro::{component, island, slice, slot, view, Params};
-cfg_if::cfg_if!(
-    if #[cfg(feature="spin")] {
-        pub use leptos_spin_macro::server;
-    } else {
-        pub use leptos_macro::server;
-    }
-);
-pub use leptos_reactive::*;
-pub use leptos_server::{
-    self, create_action, create_multi_action, create_server_action,
-    create_server_multi_action, Action, MultiAction, ServerFnError,
-    ServerFnErrorErr,
-};
-pub use server_fn::{self, ServerFn as _};
-mod error_boundary;
-pub use error_boundary::*;
-mod animated_show;
-mod for_loop;
-mod provider;
-mod show;
-pub use animated_show::*;
-pub use for_loop::*;
-pub use provider::*;
-#[cfg(feature = "experimental-islands")]
-pub use serde;
-#[cfg(feature = "experimental-islands")]
-pub use serde_json;
-pub use show::*;
-//pub use suspense_component::*;
-mod suspense_component;
-//mod transition;
-#[cfg(feature = "tracing")]
-#[doc(hidden)]
-pub use tracing;
-pub use transition::*;
-#[doc(hidden)]
-pub use typed_builder;
-#[doc(hidden)]
-pub use typed_builder::Optional;
-#[doc(hidden)]
-pub use typed_builder_macro;
-#[doc(hidden)]
-#[cfg(any(
-    feature = "csr",
-    feature = "hydrate",
-    feature = "template_macro"
-))]
-pub use wasm_bindgen; // used in islands
-#[doc(hidden)]
-#[cfg(any(
-    feature = "csr",
-    feature = "hydrate",
-    feature = "template_macro"
-))]
-pub use web_sys; // used in islands
-
-mod children;
-mod portal;
-mod view_fn;
-pub use children::*;
-pub use portal::*;
-pub use view_fn::*;
-
-extern crate self as leptos;
-
-/// A type for taking anything that implements [`IntoAttribute`].
-///
-/// ```rust
-/// use leptos::*;
-///
-/// #[component]
-/// pub fn MyHeading(
-///     text: String,
-///     #[prop(optional, into)] class: Option<AttributeValue>,
-/// ) -> impl IntoView {
-///     view! {
-///       <h1 class=class>{text}</h1>
-///     }
-/// }
-/// ```
-pub type AttributeValue = Box<dyn IntoAttribute>;
-
-#[doc(hidden)]
-pub trait Component<P> {}
-
-#[doc(hidden)]
-pub trait Props {
-    type Builder;
-    fn builder() -> Self::Builder;
-}
-
-#[doc(hidden)]
-pub trait DynAttrs {
-    fn dyn_attrs(self, _args: Vec<(&'static str, Attribute)>) -> Self
-    where
-        Self: Sized,
-    {
-        self
-    }
-}
-
-impl DynAttrs for () {}
-
-#[doc(hidden)]
-pub trait DynBindings {
-    fn dyn_bindings<B: Into<Binding>>(
-        self,
-        _args: impl IntoIterator<Item = B>,
-    ) -> Self
-    where
-        Self: Sized,
-    {
-        self
-    }
-}
-
-impl DynBindings for () {}
-
-#[doc(hidden)]
-pub trait PropsOrNoPropsBuilder {
-    type Builder;
-    fn builder_or_not() -> Self::Builder;
-}
-
-#[doc(hidden)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct EmptyPropsBuilder {}
-
-impl EmptyPropsBuilder {
-    pub fn build(self) {}
-}
-
-impl<P: Props> PropsOrNoPropsBuilder for P {
-    type Builder = <P as Props>::Builder;
-    fn builder_or_not() -> Self::Builder {
-        Self::builder()
-    }
-}
-
-impl PropsOrNoPropsBuilder for EmptyPropsBuilder {
-    type Builder = EmptyPropsBuilder;
-    fn builder_or_not() -> Self::Builder {
-        EmptyPropsBuilder {}
-    }
-}
-
-impl<F, R> Component<EmptyPropsBuilder> for F where F: FnOnce() -> R {}
-
-impl<P, F, R> Component<P> for F
-where
-    F: FnOnce(P) -> R,
-    P: Props,
-{
-}
-
-#[doc(hidden)]
-pub fn component_props_builder<P: PropsOrNoPropsBuilder>(
-    _f: &impl Component<P>,
-) -> <P as PropsOrNoPropsBuilder>::Builder {
-    <P as PropsOrNoPropsBuilder>::builder_or_not()
-}
-
-#[doc(hidden)]
-pub fn component_view<P>(f: impl ComponentConstructor<P>, props: P) -> View {
-    f.construct(props)
-}
-
-#[doc(hidden)]
-pub trait ComponentConstructor<P> {
-    fn construct(self, props: P) -> View;
-}
-
-impl<Func, V> ComponentConstructor<()> for Func
-where
-    Func: FnOnce() -> V,
-    V: IntoView,
-{
-    fn construct(self, (): ()) -> View {
-        (self)().into_view()
-    }
-}
-
-impl<Func, V, P> ComponentConstructor<P> for Func
-where
-    Func: FnOnce(P) -> V,
-    V: IntoView,
-    P: PropsOrNoPropsBuilder,
-{
-    fn construct(self, props: P) -> View {
-        (self)(props).into_view()
-    }
-}*/

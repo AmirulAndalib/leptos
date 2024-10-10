@@ -64,8 +64,8 @@ pub fn RouterExample() -> impl IntoView {
 
 // You can define other routes in their own component.
 // Routes implement the MatchNestedRoutes
-#[component]
-pub fn ContactRoutes() -> impl MatchNestedRoutes<Dom> + Clone {
+#[component(transparent)]
+pub fn ContactRoutes() -> impl MatchNestedRoutes + Clone {
     view! {
         <ParentRoute path=path!("") view=ContactList>
             <Route path=path!("/") view=|| "Select a contact."/>

@@ -3,14 +3,30 @@
 /// Types that abstract over signals with values that can be read.
 pub mod read {
     use crate::{
-        computed::{ArcMemo, Memo},
-        owner::{FromLocal, LocalStorage, Storage, StoredValue, SyncStorage},
-        signal::{ArcReadSignal, ArcRwSignal, ReadSignal, RwSignal},
-        traits::{DefinedAt, Dispose, Get, With, WithUntracked},
-        untrack, unwrap_signal,
+        computed::{ArcMemo, Memo, MemoInner},
+        graph::untrack,
+        owner::{
+            ArcStoredValue, ArenaItem, FromLocal, LocalStorage, Storage,
+            SyncStorage,
+        },
+        signal::{
+            guards::{Mapped, Plain, ReadGuard},
+            ArcReadSignal, ArcRwSignal, ReadSignal, RwSignal,
+        },
+        traits::{
+            DefinedAt, Dispose, Get, Read, ReadUntracked, ReadValue, Track,
+            With, WithValue,
+        },
+        unwrap_signal,
     };
     use send_wrapper::SendWrapper;
-    use std::{panic::Location, sync::Arc};
+    use std::{
+        borrow::Borrow,
+        fmt::Display,
+        ops::Deref,
+        panic::Location,
+        sync::{Arc, RwLock},
+    };
 
     /// Possibilities for the inner type of a [`Signal`].
     pub enum SignalTypes<T, S = SyncStorage>
@@ -23,6 +39,8 @@ pub mod read {
         Memo(ArcMemo<T, S>),
         /// A derived signal.
         DerivedSignal(Arc<dyn Fn() -> T + Send + Sync>),
+        /// A static, stored value.
+        Stored(ArcStoredValue<T>),
     }
 
     impl<T, S> Clone for SignalTypes<T, S>
@@ -34,6 +52,7 @@ pub mod read {
                 Self::ReadSignal(arg0) => Self::ReadSignal(arg0.clone()),
                 Self::Memo(arg0) => Self::Memo(arg0.clone()),
                 Self::DerivedSignal(arg0) => Self::DerivedSignal(arg0.clone()),
+                Self::Stored(arg0) => Self::Stored(arg0.clone()),
             }
         }
     }
@@ -50,6 +69,9 @@ pub mod read {
                 Self::Memo(arg0) => f.debug_tuple("Memo").field(arg0).finish(),
                 Self::DerivedSignal(_) => {
                     f.debug_tuple("DerivedSignal").finish()
+                }
+                Self::Stored(arg0) => {
+                    f.debug_tuple("Static").field(arg0).finish()
                 }
             }
         }
@@ -131,7 +153,7 @@ pub mod read {
         /// Wraps a derived signal, i.e., any computation that accesses one or more
         /// reactive signals.
         /// ```rust
-        /// # use reactive_graph::signal::*;
+        /// # use reactive_graph::signal::*; let owner = reactive_graph::owner::Owner::new(); owner.set();
         /// # use reactive_graph::wrappers::read::ArcSignal;
         /// # use reactive_graph::prelude::*;
         /// let (count, set_count) = arc_signal(2);
@@ -167,6 +189,39 @@ pub mod read {
                 defined_at: std::panic::Location::caller(),
             }
         }
+
+        /// Moves a static, nonreactive value into a signal, backed by [`ArcStoredValue`].
+        #[track_caller]
+        pub fn stored(value: T) -> Self {
+            Self {
+                inner: SignalTypes::Stored(ArcStoredValue::new(value)),
+                #[cfg(debug_assertions)]
+                defined_at: std::panic::Location::caller(),
+            }
+        }
+    }
+
+    impl<T, S> ArcSignal<T, S>
+    where
+        S: Storage<T>,
+    {
+        /// Subscribes to this signal in the current reactive scope without doing anything with its value.
+        #[track_caller]
+        pub fn track(&self) {
+            match &self.inner {
+                SignalTypes::ReadSignal(i) => {
+                    i.track();
+                }
+                SignalTypes::Memo(i) => {
+                    i.track();
+                }
+                SignalTypes::DerivedSignal(i) => {
+                    i();
+                }
+                // Doesn't change.
+                SignalTypes::Stored(_) => {}
+            }
+        }
     }
 
     impl<T> Default for ArcSignal<T, SyncStorage>
@@ -174,7 +229,7 @@ pub mod read {
         T: Default + Send + Sync + 'static,
     {
         fn default() -> Self {
-            Self::derive(|| Default::default())
+            Self::stored(Default::default())
         }
     }
 
@@ -230,24 +285,6 @@ pub mod read {
         }
     }
 
-    impl<T, S> WithUntracked for ArcSignal<T, S>
-    where
-        S: Storage<T>,
-    {
-        type Value = T;
-
-        fn try_with_untracked<U>(
-            &self,
-            fun: impl FnOnce(&Self::Value) -> U,
-        ) -> Option<U> {
-            match &self.inner {
-                SignalTypes::ReadSignal(i) => i.try_with_untracked(fun),
-                SignalTypes::Memo(i) => i.try_with_untracked(fun),
-                SignalTypes::DerivedSignal(i) => Some(untrack(|| fun(&i()))),
-            }
-        }
-    }
-
     impl<T, S> With for ArcSignal<T, S>
     where
         S: Storage<T>,
@@ -263,7 +300,60 @@ pub mod read {
                 SignalTypes::ReadSignal(i) => i.try_with(fun),
                 SignalTypes::Memo(i) => i.try_with(fun),
                 SignalTypes::DerivedSignal(i) => Some(fun(&i())),
+                SignalTypes::Stored(i) => i.try_with_value(fun),
             }
+        }
+    }
+
+    impl<T, S> ReadUntracked for ArcSignal<T, S>
+    where
+        S: Storage<T>,
+    {
+        type Value = ReadGuard<T, SignalReadGuard<T, S>>;
+
+        fn try_read_untracked(&self) -> Option<Self::Value> {
+            match &self.inner {
+                SignalTypes::ReadSignal(i) => {
+                    i.try_read_untracked().map(SignalReadGuard::Read)
+                }
+                SignalTypes::Memo(i) => {
+                    i.try_read_untracked().map(SignalReadGuard::Memo)
+                }
+                SignalTypes::DerivedSignal(i) => {
+                    Some(SignalReadGuard::Owned(untrack(|| i())))
+                }
+                SignalTypes::Stored(i) => {
+                    i.try_read_value().map(SignalReadGuard::Read)
+                }
+            }
+            .map(ReadGuard::new)
+        }
+    }
+
+    impl<T, S> Read for ArcSignal<T, S>
+    where
+        S: Storage<T>,
+    {
+        type Value = ReadGuard<T, SignalReadGuard<T, S>>;
+
+        fn try_read(&self) -> Option<Self::Value> {
+            match &self.inner {
+                SignalTypes::ReadSignal(i) => {
+                    i.try_read().map(SignalReadGuard::Read)
+                }
+                SignalTypes::Memo(i) => i.try_read().map(SignalReadGuard::Memo),
+                SignalTypes::DerivedSignal(i) => {
+                    Some(SignalReadGuard::Owned(i()))
+                }
+                SignalTypes::Stored(i) => {
+                    i.try_read_value().map(SignalReadGuard::Read)
+                }
+            }
+            .map(ReadGuard::new)
+        }
+
+        fn read(&self) -> Self::Value {
+            self.try_read().unwrap_or_else(unwrap_signal!(self))
         }
     }
 
@@ -279,7 +369,7 @@ pub mod read {
     {
         #[cfg(debug_assertions)]
         defined_at: &'static Location<'static>,
-        inner: StoredValue<SignalTypes<T, S>, S>,
+        inner: ArenaItem<SignalTypes<T, S>, S>,
     }
 
     impl<T, S> Dispose for Signal<T, S>
@@ -342,31 +432,6 @@ pub mod read {
         }
     }
 
-    impl<T, S> WithUntracked for Signal<T, S>
-    where
-        T: 'static,
-        S: Storage<SignalTypes<T, S>> + Storage<T>,
-    {
-        type Value = T;
-
-        fn try_with_untracked<U>(
-            &self,
-            fun: impl FnOnce(&Self::Value) -> U,
-        ) -> Option<U> {
-            self.inner
-                // clone the inner Arc type and release the lock
-                // prevents deadlocking if the derived value includes taking a lock on the arena
-                .try_with_value(Clone::clone)
-                .and_then(|inner| match &inner {
-                    SignalTypes::ReadSignal(i) => i.try_with_untracked(fun),
-                    SignalTypes::Memo(i) => i.try_with_untracked(fun),
-                    SignalTypes::DerivedSignal(i) => {
-                        Some(untrack(|| fun(&i())))
-                    }
-                })
-        }
-    }
-
     impl<T, S> With for Signal<T, S>
     where
         T: 'static,
@@ -386,7 +451,76 @@ pub mod read {
                     SignalTypes::ReadSignal(i) => i.try_with(fun),
                     SignalTypes::Memo(i) => i.try_with(fun),
                     SignalTypes::DerivedSignal(i) => Some(fun(&i())),
+                    SignalTypes::Stored(i) => i.try_with_value(fun),
                 })
+        }
+    }
+
+    impl<T, S> ReadUntracked for Signal<T, S>
+    where
+        T: 'static,
+        S: Storage<SignalTypes<T, S>> + Storage<T>,
+    {
+        type Value = ReadGuard<T, SignalReadGuard<T, S>>;
+
+        fn try_read_untracked(&self) -> Option<Self::Value> {
+            self.inner
+                // clone the inner Arc type and release the lock
+                // prevents deadlocking if the derived value includes taking a lock on the arena
+                .try_with_value(Clone::clone)
+                .and_then(|inner| {
+                    match &inner {
+                        SignalTypes::ReadSignal(i) => {
+                            i.try_read_untracked().map(SignalReadGuard::Read)
+                        }
+                        SignalTypes::Memo(i) => {
+                            i.try_read_untracked().map(SignalReadGuard::Memo)
+                        }
+                        SignalTypes::DerivedSignal(i) => {
+                            Some(SignalReadGuard::Owned(untrack(|| i())))
+                        }
+                        SignalTypes::Stored(i) => {
+                            i.try_read_value().map(SignalReadGuard::Read)
+                        }
+                    }
+                    .map(ReadGuard::new)
+                })
+        }
+    }
+
+    impl<T, S> Read for Signal<T, S>
+    where
+        T: 'static,
+        S: Storage<SignalTypes<T, S>> + Storage<T>,
+    {
+        type Value = ReadGuard<T, SignalReadGuard<T, S>>;
+
+        fn try_read(&self) -> Option<Self::Value> {
+            self.inner
+                // clone the inner Arc type and release the lock
+                // prevents deadlocking if the derived value includes taking a lock on the arena
+                .try_with_value(Clone::clone)
+                .and_then(|inner| {
+                    match &inner {
+                        SignalTypes::ReadSignal(i) => {
+                            i.try_read().map(SignalReadGuard::Read)
+                        }
+                        SignalTypes::Memo(i) => {
+                            i.try_read().map(SignalReadGuard::Memo)
+                        }
+                        SignalTypes::DerivedSignal(i) => {
+                            Some(SignalReadGuard::Owned(i()))
+                        }
+                        SignalTypes::Stored(i) => {
+                            i.try_read_value().map(SignalReadGuard::Read)
+                        }
+                    }
+                    .map(ReadGuard::new)
+                })
+        }
+
+        fn read(&self) -> Self::Value {
+            self.try_read().unwrap_or_else(unwrap_signal!(self))
         }
     }
 
@@ -397,7 +531,7 @@ pub mod read {
         /// Wraps a derived signal, i.e., any computation that accesses one or more
         /// reactive signals.
         /// ```rust
-        /// # use reactive_graph::signal::*;
+        /// # use reactive_graph::signal::*; let owner = reactive_graph::owner::Owner::new(); owner.set();
         /// # use reactive_graph::wrappers::read::Signal;
         /// # use reactive_graph::prelude::*;
         /// let (count, set_count) = signal(2);
@@ -425,9 +559,21 @@ pub mod read {
             };
 
             Self {
-                inner: StoredValue::new_with_storage(
-                    SignalTypes::DerivedSignal(Arc::new(derived_signal)),
-                ),
+                inner: ArenaItem::new_with_storage(SignalTypes::DerivedSignal(
+                    Arc::new(derived_signal),
+                )),
+                #[cfg(debug_assertions)]
+                defined_at: std::panic::Location::caller(),
+            }
+        }
+
+        /// Moves a static, nonreactive value into a signal, backed by [`ArcStoredValue`].
+        #[track_caller]
+        pub fn stored(value: T) -> Self {
+            Self {
+                inner: ArenaItem::new_with_storage(SignalTypes::Stored(
+                    ArcStoredValue::new(value),
+                )),
                 #[cfg(debug_assertions)]
                 defined_at: std::panic::Location::caller(),
             }
@@ -452,11 +598,54 @@ pub mod read {
             };
 
             Self {
-                inner: StoredValue::new_local(SignalTypes::DerivedSignal(
+                inner: ArenaItem::new_local(SignalTypes::DerivedSignal(
                     Arc::new(derived_signal),
                 )),
                 #[cfg(debug_assertions)]
                 defined_at: std::panic::Location::caller(),
+            }
+        }
+
+        /// Moves a static, nonreactive value into a signal, backed by [`ArcStoredValue`].
+        /// Works like [`Signal::stored`] but uses [`LocalStorage`].
+        #[track_caller]
+        pub fn stored_local(value: T) -> Self {
+            Self {
+                inner: ArenaItem::new_local(SignalTypes::Stored(
+                    ArcStoredValue::new(value),
+                )),
+                #[cfg(debug_assertions)]
+                defined_at: std::panic::Location::caller(),
+            }
+        }
+    }
+
+    impl<T, S> Signal<T, S>
+    where
+        T: 'static,
+        S: Storage<SignalTypes<T, S>> + Storage<T>,
+    {
+        /// Subscribes to this signal in the current reactive scope without doing anything with its value.
+        #[track_caller]
+        pub fn track(&self) {
+            let inner = self
+                .inner
+                // clone the inner Arc type and release the lock
+                // prevents deadlocking if the derived value includes taking a lock on the arena
+                .try_with_value(Clone::clone)
+                .unwrap_or_else(unwrap_signal!(self));
+            match inner {
+                SignalTypes::ReadSignal(i) => {
+                    i.track();
+                }
+                SignalTypes::Memo(i) => {
+                    i.track();
+                }
+                SignalTypes::DerivedSignal(i) => {
+                    i();
+                }
+                // Doesn't change.
+                SignalTypes::Stored(_) => {}
             }
         }
     }
@@ -466,7 +655,7 @@ pub mod read {
         T: Send + Sync + Default + 'static,
     {
         fn default() -> Self {
-            Self::derive(|| Default::default())
+            Self::stored(Default::default())
         }
     }
 
@@ -475,34 +664,34 @@ pub mod read {
         T: Default + 'static,
     {
         fn default() -> Self {
-            Self::derive_local(|| Default::default())
+            Self::stored_local(Default::default())
         }
     }
 
-    impl<T: Clone + Send + Sync + 'static> From<T> for ArcSignal<T, SyncStorage> {
+    impl<T: Send + Sync + 'static> From<T> for ArcSignal<T, SyncStorage> {
         #[track_caller]
         fn from(value: T) -> Self {
-            Self::derive(move || value.clone())
+            ArcSignal::stored(value)
         }
     }
 
     impl<T> From<T> for Signal<T>
     where
-        T: Clone + Send + Sync + 'static,
+        T: Send + Sync + 'static,
     {
         #[track_caller]
         fn from(value: T) -> Self {
-            Self::derive(move || value.clone())
+            Self::stored(value)
         }
     }
 
     impl<T> From<T> for Signal<T, LocalStorage>
     where
-        T: Clone + 'static,
+        T: 'static,
     {
         #[track_caller]
         fn from(value: T) -> Self {
-            Self::derive_local(move || value.clone())
+            Self::stored_local(value)
         }
     }
 
@@ -515,7 +704,7 @@ pub mod read {
             Signal {
                 #[cfg(debug_assertions)]
                 defined_at: Location::caller(),
-                inner: StoredValue::new(value.inner),
+                inner: ArenaItem::new(value.inner),
             }
         }
     }
@@ -529,7 +718,7 @@ pub mod read {
             Signal {
                 #[cfg(debug_assertions)]
                 defined_at: Location::caller(),
-                inner: StoredValue::new_local(value.inner),
+                inner: ArenaItem::new_local(value.inner),
             }
         }
     }
@@ -558,7 +747,7 @@ pub mod read {
         #[track_caller]
         fn from(value: ReadSignal<T>) -> Self {
             Self {
-                inner: StoredValue::new(SignalTypes::ReadSignal(value.into())),
+                inner: ArenaItem::new(SignalTypes::ReadSignal(value.into())),
                 #[cfg(debug_assertions)]
                 defined_at: std::panic::Location::caller(),
             }
@@ -572,7 +761,7 @@ pub mod read {
         #[track_caller]
         fn from(value: ReadSignal<T, LocalStorage>) -> Self {
             Self {
-                inner: StoredValue::new_local(SignalTypes::ReadSignal(
+                inner: ArenaItem::new_local(SignalTypes::ReadSignal(
                     value.into(),
                 )),
                 #[cfg(debug_assertions)]
@@ -588,7 +777,7 @@ pub mod read {
         #[track_caller]
         fn from(value: RwSignal<T>) -> Self {
             Self {
-                inner: StoredValue::new(SignalTypes::ReadSignal(
+                inner: ArenaItem::new(SignalTypes::ReadSignal(
                     value.read_only().into(),
                 )),
                 #[cfg(debug_assertions)]
@@ -604,7 +793,7 @@ pub mod read {
         #[track_caller]
         fn from(value: RwSignal<T, LocalStorage>) -> Self {
             Self {
-                inner: StoredValue::new_local(SignalTypes::ReadSignal(
+                inner: ArenaItem::new_local(SignalTypes::ReadSignal(
                     value.read_only().into(),
                 )),
                 #[cfg(debug_assertions)]
@@ -620,7 +809,7 @@ pub mod read {
         #[track_caller]
         fn from(value: Memo<T>) -> Self {
             Self {
-                inner: StoredValue::new(SignalTypes::Memo(value.into())),
+                inner: ArenaItem::new(SignalTypes::Memo(value.into())),
                 #[cfg(debug_assertions)]
                 defined_at: std::panic::Location::caller(),
             }
@@ -634,7 +823,7 @@ pub mod read {
         #[track_caller]
         fn from(value: Memo<T, LocalStorage>) -> Self {
             Self {
-                inner: StoredValue::new_local(SignalTypes::Memo(value.into())),
+                inner: ArenaItem::new_local(SignalTypes::Memo(value.into())),
                 #[cfg(debug_assertions)]
                 defined_at: std::panic::Location::caller(),
             }
@@ -647,7 +836,7 @@ pub mod read {
     /// of the same type. This is especially useful for component properties.
     ///
     /// ```
-    /// # use reactive_graph::signal::*;
+    /// # use reactive_graph::signal::*; let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # use reactive_graph::wrappers::read::MaybeSignal;
     /// # use reactive_graph::computed::Memo;
     /// # use reactive_graph::prelude::*;
@@ -714,23 +903,6 @@ pub mod read {
         }
     }
 
-    impl<T, S> WithUntracked for MaybeSignal<T, S>
-    where
-        S: Storage<SignalTypes<T, S>> + Storage<T>,
-    {
-        type Value = T;
-
-        fn try_with_untracked<U>(
-            &self,
-            fun: impl FnOnce(&Self::Value) -> U,
-        ) -> Option<U> {
-            match self {
-                Self::Static(t) => Some(fun(t)),
-                Self::Dynamic(s) => s.try_with_untracked(fun),
-            }
-        }
-    }
-
     impl<T, S> With for MaybeSignal<T, S>
     where
         T: Send + Sync + 'static,
@@ -746,6 +918,44 @@ pub mod read {
                 Self::Static(t) => Some(fun(t)),
                 Self::Dynamic(s) => s.try_with(fun),
             }
+        }
+    }
+
+    impl<T, S> ReadUntracked for MaybeSignal<T, S>
+    where
+        T: Clone,
+        S: Storage<SignalTypes<T, S>> + Storage<T>,
+    {
+        type Value = ReadGuard<T, SignalReadGuard<T, S>>;
+
+        fn try_read_untracked(&self) -> Option<Self::Value> {
+            match self {
+                Self::Static(t) => {
+                    Some(ReadGuard::new(SignalReadGuard::Owned(t.clone())))
+                }
+                Self::Dynamic(s) => s.try_read_untracked(),
+            }
+        }
+    }
+
+    impl<T, S> Read for MaybeSignal<T, S>
+    where
+        T: Clone,
+        S: Storage<SignalTypes<T, S>> + Storage<T>,
+    {
+        type Value = ReadGuard<T, SignalReadGuard<T, S>>;
+
+        fn try_read(&self) -> Option<Self::Value> {
+            match self {
+                Self::Static(t) => {
+                    Some(ReadGuard::new(SignalReadGuard::Owned(t.clone())))
+                }
+                Self::Dynamic(s) => s.try_read(),
+            }
+        }
+
+        fn read(&self) -> Self::Value {
+            self.try_read().unwrap_or_else(unwrap_signal!(self))
         }
     }
 
@@ -767,6 +977,21 @@ pub mod read {
         /// reactive signals.
         pub fn derive_local(derived_signal: impl Fn() -> T + 'static) -> Self {
             Self::Dynamic(Signal::derive_local(derived_signal))
+        }
+    }
+
+    impl<T, S> MaybeSignal<T, S>
+    where
+        T: 'static,
+        S: Storage<SignalTypes<T, S>> + Storage<T>,
+    {
+        /// Subscribes to this signal in the current reactive scope without doing anything with its value.
+        #[track_caller]
+        pub fn track(&self) {
+            match self {
+                Self::Static(_) => {}
+                Self::Dynamic(signal) => signal.track(),
+            }
         }
     }
 
@@ -892,7 +1117,7 @@ pub mod read {
 
     impl<S> From<&str> for MaybeSignal<String, S>
     where
-        S: Storage<String>,
+        S: Storage<String> + Storage<Arc<RwLock<String>>>,
     {
         fn from(value: &str) -> Self {
             Self::Static(value.to_string())
@@ -907,7 +1132,7 @@ pub mod read {
     ///
     /// ## Examples
     /// ```rust
-    /// # use reactive_graph::signal::*;
+    /// # use reactive_graph::signal::*; let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # use reactive_graph::wrappers::read::MaybeProp;
     /// # use reactive_graph::computed::Memo;
     /// # use reactive_graph::prelude::*;
@@ -967,23 +1192,6 @@ pub mod read {
         }
     }
 
-    impl<T, S> WithUntracked for MaybeProp<T, S>
-    where
-        S: Storage<SignalTypes<Option<T>, S>> + Storage<Option<T>>,
-    {
-        type Value = Option<T>;
-
-        fn try_with_untracked<U>(
-            &self,
-            fun: impl FnOnce(&Self::Value) -> U,
-        ) -> Option<U> {
-            match &self.0 {
-                None => Some(fun(&None)),
-                Some(inner) => inner.try_with_untracked(fun),
-            }
-        }
-    }
-
     impl<T, S> With for MaybeProp<T, S>
     where
         T: Send + Sync + 'static,
@@ -1002,6 +1210,40 @@ pub mod read {
         }
     }
 
+    impl<T, S> ReadUntracked for MaybeProp<T, S>
+    where
+        T: Clone,
+        S: Storage<SignalTypes<Option<T>, S>> + Storage<Option<T>>,
+    {
+        type Value = ReadGuard<Option<T>, SignalReadGuard<Option<T>, S>>;
+
+        fn try_read_untracked(&self) -> Option<Self::Value> {
+            match &self.0 {
+                None => Some(ReadGuard::new(SignalReadGuard::Owned(None))),
+                Some(inner) => inner.try_read_untracked(),
+            }
+        }
+    }
+
+    impl<T, S> Read for MaybeProp<T, S>
+    where
+        T: Clone,
+        S: Storage<SignalTypes<Option<T>, S>> + Storage<Option<T>>,
+    {
+        type Value = ReadGuard<Option<T>, SignalReadGuard<Option<T>, S>>;
+
+        fn try_read(&self) -> Option<Self::Value> {
+            match &self.0 {
+                None => Some(ReadGuard::new(SignalReadGuard::Owned(None))),
+                Some(inner) => inner.try_read(),
+            }
+        }
+
+        fn read(&self) -> Self::Value {
+            self.try_read().unwrap_or_else(unwrap_signal!(self))
+        }
+    }
+
     impl<T> MaybeProp<T>
     where
         T: Send + Sync,
@@ -1012,6 +1254,21 @@ pub mod read {
             derived_signal: impl Fn() -> Option<T> + Send + Sync + 'static,
         ) -> Self {
             Self(Some(MaybeSignal::derive(derived_signal)))
+        }
+    }
+
+    impl<T, S> MaybeProp<T, S>
+    where
+        T: 'static,
+        S: Storage<SignalTypes<Option<T>, S>> + Storage<Option<T>>,
+    {
+        /// Subscribes to this signal in the current reactive scope without doing anything with its value.
+        #[track_caller]
+        pub fn track(&self) {
+            match &self.0 {
+                None => {}
+                Some(signal) => signal.track(),
+            }
         }
     }
 
@@ -1241,12 +1498,82 @@ pub mod read {
             Self(Some(MaybeSignal::from_local(Some(value.to_string()))))
         }
     }
+
+    /// The content of a [`Signal`] wrapper read guard, variable depending on the signal type.
+    #[derive(Debug)]
+    pub enum SignalReadGuard<T: 'static, S: Storage<T>> {
+        /// A read signal guard.
+        Read(ReadGuard<T, Plain<T>>),
+        /// A memo guard.
+        Memo(ReadGuard<T, Mapped<Plain<MemoInner<T, S>>, T>>),
+        /// A fake guard for derived signals, the content had to actually be cloned, so it's not a guard but we pretend it is.
+        Owned(T),
+    }
+
+    impl<T, S> Clone for SignalReadGuard<T, S>
+    where
+        S: Storage<T>,
+        T: Clone,
+        Plain<T>: Clone,
+        Mapped<Plain<MemoInner<T, S>>, T>: Clone,
+    {
+        fn clone(&self) -> Self {
+            match self {
+                SignalReadGuard::Read(i) => SignalReadGuard::Read(i.clone()),
+                SignalReadGuard::Memo(i) => SignalReadGuard::Memo(i.clone()),
+                SignalReadGuard::Owned(i) => SignalReadGuard::Owned(i.clone()),
+            }
+        }
+    }
+
+    impl<T, S> Deref for SignalReadGuard<T, S>
+    where
+        S: Storage<T>,
+    {
+        type Target = T;
+        fn deref(&self) -> &Self::Target {
+            match self {
+                SignalReadGuard::Read(i) => i,
+                SignalReadGuard::Memo(i) => i,
+                SignalReadGuard::Owned(i) => i,
+            }
+        }
+    }
+
+    impl<T, S> Borrow<T> for SignalReadGuard<T, S>
+    where
+        S: Storage<T>,
+    {
+        fn borrow(&self) -> &T {
+            self.deref()
+        }
+    }
+
+    impl<T, S> PartialEq<T> for SignalReadGuard<T, S>
+    where
+        S: Storage<T>,
+        T: PartialEq,
+    {
+        fn eq(&self, other: &T) -> bool {
+            self.deref() == other
+        }
+    }
+
+    impl<T, S> Display for SignalReadGuard<T, S>
+    where
+        S: Storage<T>,
+        T: Display,
+    {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Display::fmt(&**self, f)
+        }
+    }
 }
 
 /// Types that abstract over the ability to update a signal.
 pub mod write {
     use crate::{
-        owner::{Storage, StoredValue, SyncStorage},
+        owner::{ArenaItem, Storage, SyncStorage},
         signal::{ArcRwSignal, ArcWriteSignal, RwSignal, WriteSignal},
         traits::Set,
     };
@@ -1282,7 +1609,7 @@ pub mod write {
     ///
     /// ## Examples
     /// ```rust
-    /// # use reactive_graph::prelude::*;
+    /// # use reactive_graph::prelude::*;  let owner = reactive_graph::owner::Owner::new(); owner.set();
     /// # use reactive_graph::wrappers::write::SignalSetter;
     /// # use reactive_graph::signal::signal;
     /// let (count, set_count) = signal(2);
@@ -1341,7 +1668,7 @@ pub mod write {
                 SignalSetterTypes::Default => {}
                 SignalSetterTypes::Write(w) => w.set(new_value),
                 SignalSetterTypes::Mapped(s) => {
-                    s.with_value(|setter| setter(new_value))
+                    s.try_with_value(|setter| setter(new_value));
                 }
             }
         }
@@ -1371,9 +1698,9 @@ pub mod write {
         #[track_caller]
         pub fn map(mapped_setter: impl Fn(T) + Send + Sync + 'static) -> Self {
             Self {
-                inner: SignalSetterTypes::Mapped(
-                    StoredValue::new_with_storage(Box::new(mapped_setter)),
-                ),
+                inner: SignalSetterTypes::Mapped(ArenaItem::new_with_storage(
+                    Box::new(mapped_setter),
+                )),
                 #[cfg(debug_assertions)]
                 defined_at: std::panic::Location::caller(),
             }
@@ -1411,7 +1738,7 @@ pub mod write {
         T: 'static,
     {
         Write(WriteSignal<T, S>),
-        Mapped(StoredValue<Box<dyn Fn(T) + Send + Sync>, S>),
+        Mapped(ArenaItem<Box<dyn Fn(T) + Send + Sync>, S>),
         Default,
     }
 

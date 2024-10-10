@@ -15,6 +15,7 @@ use crate::{
 };
 pub use arc_memo::*;
 pub use async_derived::*;
+pub(crate) use inner::MemoInner;
 pub use memo::*;
 pub use selector::*;
 
@@ -34,7 +35,7 @@ pub use selector::*;
 /// In the example below, setting an auth token will only trigger
 /// the token signal, but none of the other derived signals.
 /// ```
-/// # use reactive_graph::prelude::*;
+/// # use reactive_graph::prelude::*; let owner = reactive_graph::owner::Owner::new(); owner.set();
 /// # use reactive_graph::effect::Effect;
 /// # use reactive_graph::signal::RwSignal;
 /// # use reactive_graph::computed::*;
